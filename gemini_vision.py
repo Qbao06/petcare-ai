@@ -1,9 +1,8 @@
-import json
-import re
-from google import genai
-from google.genai import types
+import os, io, json, re
+from PIL import Image
+import google.generativeai as genai
 
-MODEL_ID = "gemini-2.5-flash"
+MODEL_ID = "gemini-1.5-flash"
 
 SIGNS_SCHEMA = {
     "circular_hair_loss": bool,
@@ -18,28 +17,18 @@ SIGNS_SCHEMA = {
 }
 
 def _extract_json_balanced(text: str) -> str:
-    """
-    Extract first JSON object by scanning + balancing braces.
-    If missing closing braces, auto-append required number of '}'.
-    """
     if not text:
         raise ValueError("Empty response text")
-
     t = text.strip()
-    # strip markdown fences
     t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*```$", "", t)
-
     start = t.find("{")
     if start == -1:
         raise ValueError(f"No JSON start found. Head={t[:200]!r}")
-
     s = t[start:]
-
     depth = 0
     in_str = False
     esc = False
-
     for i, ch in enumerate(s):
         if in_str:
             if esc:
@@ -51,8 +40,6 @@ def _extract_json_balanced(text: str) -> str:
             if ch == '"':
                 in_str = False
             continue
-
-        # not in string
         if ch == '"':
             in_str = True
             continue
@@ -62,24 +49,17 @@ def _extract_json_balanced(text: str) -> str:
             depth -= 1
             if depth == 0:
                 return s[: i + 1]
-
-    # If we reached end and still inside object -> auto-close
     if depth > 0:
         return s + ("}" * depth)
-
     raise ValueError(f"No JSON object found. Head={t[:200]!r}")
 
 def _safe_load_json(text: str) -> dict:
     raw = _extract_json_balanced(text)
-
-    # cleanup common issues
-    raw2 = re.sub(r",\s*([}\]])", r"\1", raw)  # trailing commas
+    raw2 = re.sub(r",\s*([}\]])", r"\1", raw)
     raw2 = raw2.replace("“", "\"").replace("”", "\"").replace("’", "'")
-
     try:
         return json.loads(raw2)
     except json.JSONDecodeError:
-        # last resort: replace single quotes
         raw3 = raw2.replace("'", "\"")
         raw3 = re.sub(r",\s*([}\]])", r"\1", raw3)
         return json.loads(raw3)
@@ -124,45 +104,29 @@ def _build_prompt() -> str:
     )
 
 def extract_signs_from_image(image_bytes: bytes, mime_type: str) -> dict:
-    client = genai.Client()
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Set it in Streamlit Secrets.")
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(MODEL_ID)
+
     prompt = _build_prompt()
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    def _call(json_mode: bool, max_tokens: int) -> str:
-        cfg = types.GenerateContentConfig(
-            temperature=0,
-            max_output_tokens=max_tokens,
-        )
-        if json_mode:
-            cfg.response_mime_type = "application/json"
-
-        resp = client.models.generate_content(
-            model=MODEL_ID,
-            contents=[{
-                "role": "user",
-                "parts": [
-                    {"text": prompt},
-                    {"inline_data": {"mime_type": mime_type, "data": image_bytes}},
-                ],
-            }],
-            config=cfg,
-        )
-        return (resp.text or "").strip()
-
-    # Retry plan (ăn chắc)
-    attempts = [
-        (True, 600),
-        (True, 900),
-        (False, 900),
-    ]
-
+    attempts = [600, 900, 900]
     last_err = None
-    for json_mode, max_tokens in attempts:
+
+    for max_tokens in attempts:
         try:
-            text = _call(json_mode=json_mode, max_tokens=max_tokens)
+            resp = model.generate_content(
+                [prompt, img],
+                generation_config={"temperature": 0, "max_output_tokens": max_tokens},
+            )
+            text = (resp.text or "").strip()
             obj = _safe_load_json(text)
             return _normalize_signs(obj)
         except Exception as e:
             last_err = e
-            continue
 
     raise RuntimeError(f"Gemini parse failed after retries: {last_err}")
